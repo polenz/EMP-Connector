@@ -19,6 +19,8 @@ import org.slf4j.LoggerFactory;
 import java.net.ConnectException;
 import java.util.Map;
 import java.util.Set;
+import java.util.Timer;
+import java.util.TimerTask;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -132,8 +134,10 @@ public class EmpConnector {
      */
     public Future<Boolean> start() {
         if (running.compareAndSet(false, true)) {
+            log.info("Start EmpConnector, add listeners and clear replay hash map!");
             addListener(Channel.META_CONNECT, new AuthFailureListener());
             addListener(Channel.META_HANDSHAKE, new AuthFailureListener());
+            addListener(Channel.META_SUBSCRIBE, new SubscriptionFailureListener());
             replay.clear();
             return connect();
         }
@@ -353,7 +357,7 @@ public class EmpConnector {
     }
 
     /**
-     * Listens to /meta/connect channel messages and handles 401 errors, where client needs
+     * Listens to /meta/connect channel messages and handles 401 and 403 errors, where client needs
      * to reauthenticate.
      */
     private class AuthFailureListener implements ClientSessionChannel.MessageListener {
@@ -364,9 +368,66 @@ public class EmpConnector {
         public void onMessage(ClientSessionChannel channel, Message message) {
             if (!message.isSuccessful()) {
                 if (isError(message, ERROR_401) || isError(message, ERROR_403)) {
+                    log.info("React on error message: " + message + " and reauthenticate to the Salesforce Platform.");
                     reauthenticate.set(true);
                     disconnect();
                     reconnect();
+                }
+            }
+        }
+
+        private boolean isError(Message message, String errorCode) {
+            String error = (String)message.get(Message.ERROR_FIELD);
+            String failureReason = getFailureReason(message);
+
+            return (error != null && error.startsWith(errorCode)) ||
+                    (failureReason != null && failureReason.startsWith(errorCode));
+        }
+
+        private String getFailureReason(Message message) {
+            String failureReason = null;
+            Map<String, Object> ext = message.getExt();
+            if (ext != null) {
+                Map<String, Object> sfdc = (Map<String, Object>)ext.get("sfdc");
+                if (sfdc != null) {
+                    failureReason = (String)sfdc.get("failureReason");
+                }
+            }
+            return failureReason;
+        }
+    }
+
+    /**
+     * Listens to /meta/subscribe channel messages and handles 400/403 errors, where client needs
+     * to resubscribe.
+     */
+    private class SubscriptionFailureListener implements ClientSessionChannel.MessageListener {
+        private static final String ERROR_400 = "400";
+        private static final String ERROR_403 = "403";
+
+        @Override
+        public void onMessage(ClientSessionChannel channel, Message message) {
+            if (!message.isSuccessful()) {
+                if (isError(message, ERROR_400)) {
+                    log.info("React on error message: " + message + " and reauthenticate/clear/disconnect/reconnect to the Salesforce Platform Event topic.");
+                    reauthenticate.set(true);
+                    // added 06.09.2021
+                    replay.clear();
+                    disconnect();
+                    reconnect();
+                }
+
+                if (isError(message, ERROR_403)) {
+                    new Timer().schedule(new TimerTask() {
+
+                      @Override
+                      public void run() {
+                        log.info("React on error message: " + message + " and disconnect/reconnect to the Salesforce Platform Event topic.");
+                        reauthenticate.set(false);
+                        disconnect();
+                        reconnect();
+                      }
+                    }, 120000); // delay 2 min.
                 }
             }
         }
